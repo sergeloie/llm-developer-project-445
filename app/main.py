@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app import cards, orchestrator, permissions, sessions
+from app import cards, guardrail_client, orchestrator, permissions, sessions
 from core import config, db
 
 
@@ -109,7 +109,8 @@ def _find_card(session, pending_id: str):
         return active
     row = db.fetchone(
         "select pending_id, action, details, card, sub from pending_cards"
-        " where pending_id = %s and session_id = %s",
+        " where pending_id = %s and session_id = %s"
+        " and state = 'pending' and expires_at > now()",
         (pending_id, session.session_id),
     )
     if row is None:
@@ -129,6 +130,11 @@ async def card_decision(pending_id: str, payload: dict):
         return JSONResponse({"error": "неизвестная сессия"}, status_code=400)
     card = _find_card(session, pending_id)
     if card is None:
-        return JSONResponse({"error": "карточка не найдена"}, status_code=404)
+        return JSONResponse({"text": orchestrator.UNSAFE_CARD_REPLY}, status_code=404)
     text = await orchestrator.decide(session, card, str(payload.get("answer", "")))
+    verdict = await guardrail_client.check(text, mode="output")
+    if not verdict.available:
+        session.guard_state["ok"] = False
+    elif not verdict.safe:
+        text = orchestrator.UNSAFE_OUTPUT_REPLY
     return {"text": text}

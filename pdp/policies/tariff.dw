@@ -21,6 +21,7 @@ permit (
     action == Tel::Action::"ConfirmCard",
     resource
 )
+when { context.input.guard_ok == true }
 when temporal {
     formerly within 1h Tel::Action::"Prepare"::request{
         input.pending_id: context.input.pending_id,
@@ -35,6 +36,7 @@ permit (
     action == Tel::Action::"Execute",
     resource
 )
+when { context.input.guard_ok == true }
 when temporal {
     formerly within 1h Tel::Action::"ConfirmCard"::request{
         input.pending_id: context.input.pending_id,

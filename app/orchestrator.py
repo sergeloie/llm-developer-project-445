@@ -12,7 +12,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 
-from app import audit, cards, editor as editor_mod, idempotency, llm, planner, workers
+from app import audit, cards, editor as editor_mod, guardrail_client, idempotency, llm, planner, workers
 from app.sessions import pep_of
 from core import config, db
 
@@ -98,6 +98,48 @@ def _audit(session, what: str, outcome: str, **fields) -> None:
         pass
 
 
+UNSAFE_INPUT_REPLY = "Не могу выполнить эту просьбу: похоже на попытку изменить мои правила работы."
+UNSAFE_OUTPUT_REPLY = "Ответ заблокирован проверкой безопасности — попробуйте переформулировать вопрос."
+UNSAFE_CARD_REPLY = "Карточка не найдена или истекла."
+
+
+async def _guard_input(session, message: str) -> bool:
+    """Проверка реплики до LLM. False — ход не начинается."""
+    verdict = await guardrail_client.check(message, mode="input")
+    if not verdict.available:
+        session.guard_state["ok"] = False
+        _audit(session, "guardrail", "guardrail_degraded", detail="input")
+        return True  # чтение продолжается, actions закроет политика
+    session.guard_state["ok"] = True
+    if verdict.safe:
+        return True
+    _audit(session, "guardrail", "guardrail_unsafe", detail=verdict.category)
+    session.note(f"guardrail:unsafe:{verdict.category}")
+    return False
+
+
+async def _guard_output(session, text: str, card=None) -> tuple[bool, str]:
+    """Проверка ответа/карточки до показа; unsafe-карточку уничтожаем."""
+    verdict = await guardrail_client.check(text, mode="output")
+    if not verdict.available:
+        session.guard_state["ok"] = False
+        _audit(session, "guardrail", "guardrail_degraded", detail="output")
+        return True, text
+    if verdict.safe:
+        return True, text
+    _audit(session, "guardrail", "guardrail_unsafe", detail=verdict.category)
+    session.note(f"guardrail:unsafe:{verdict.category}")
+    if card is not None:
+        cards.settle(session, card, "denied")
+        return False, UNSAFE_CARD_REPLY
+    return False, UNSAFE_OUTPUT_REPLY
+
+
+async def _emit_reply(session, emit: Emit, text: str, sources=None) -> None:
+    ok, shown = await _guard_output(session, text)
+    await emit({"type": "reply", "text": shown, "sources": (sources or []) if ok else []})
+
+
 def _before_after(card, result: dict) -> tuple[str | None, str | None]:
     view = card.view or {}
     before = (
@@ -173,7 +215,7 @@ DENIAL_REPLIES = {
     "confirmation_missing": "Подтверждение не найдено — повторите запрос.",
     "confirmation_mismatch": "Подтверждение не совпало с карточкой — повторите запрос.",
     "pdp_unavailable": "Сервис подтверждений недоступен, попробуйте позже.",
-    "guard_not_ok": "Проверка безопасности не пройдена, действие закрыто.",
+    "guard_not_ok": "Не работает проверка безопасности — могу позвать оператора.",
     "no_write_scope": "У вас нет права менять тариф.",
     "role_has_no_write": "Ваша роль не позволяет менять тариф.",
     "identity_in_args": "Действие запрещено: идентичность уже взята из токена.",
@@ -217,6 +259,11 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     """Один ход: SSE-события plan → card|reply."""
     session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
 
+    if not await _guard_input(session, message):
+        await _emit_reply(session, emit, UNSAFE_INPUT_REPLY)
+        _persist(session)
+        return
+
     active = cards.active(session)
     if active is None:
         active = getattr(session, "done_card", None)  # повтор «да» после исполнения
@@ -225,7 +272,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         if verdict != "topic":  # «да», «нет», «оператор» — карточку обслуживает код
             reply = await decide(session, active, message)
             session.note(f"card:{verdict}")
-            await emit({"type": "reply", "text": reply, "sources": []})
+            await _emit_reply(session, emit, reply)
             _persist(session)
             return
         old_card_id = active.pending_id
@@ -233,11 +280,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         old_card_id = ""
         if cards.classify_answer(message) == "yes":  # «да» без карточки — не исполняем
             session.note("card:yes_without_card")
-            await emit({
-                "type": "reply",
-                "text": DENIAL_REPLIES["card_not_prepared"],
-                "sources": [],
-            })
+            await _emit_reply(session, emit, DENIAL_REPLIES["card_not_prepared"])
             _persist(session)
             return
 
@@ -269,7 +312,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
 
     if gated.question and not gated.steps:
         session.note("reply:question")
-        await emit({"type": "reply", "text": gated.question, "sources": []})
+        await _emit_reply(session, emit, gated.question)
         _persist(session)
         return
 
@@ -296,11 +339,18 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     fresh = cards.active(session)
     if fresh is not None and fresh.pending_id != old_card_id:
         session.note("card:pending")
-        await emit({
-            "type": "card",
-            "pending_id": fresh.pending_id,
-            "card": fresh.public_view(config.CARD_TTL_SEC),
-        })
+        card_text = " ".join(str(v) for v in (fresh.view or {}).values() if not isinstance(v, dict))
+        ok, shown = await _guard_output(
+            session, f"Карточка {fresh.action}: {card_text}", card=fresh
+        )
+        if not ok:
+            await emit({"type": "reply", "text": shown, "sources": []})
+        else:
+            await emit({
+                "type": "card",
+                "pending_id": fresh.pending_id,
+                "card": fresh.public_view(config.CARD_TTL_SEC),
+            })
         _persist(session)
         return
 
@@ -310,9 +360,8 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     )
     sources = sorted({source for run in runs for source in run["sources"]})
     session.note("reply:editor")
-    await emit({"type": "reply", "text": answer["report"], "sources": sources})
+    await _emit_reply(session, emit, answer["report"], sources)
     _persist(session)
 
-# TODO(аудит) — аудит: audit.append на все исходы пути действия.
-# TODO(права) — права: подтверждение и исполнение через PEP, Deny по reason.
-# TODO(guardrail) — guardrail: input/output проверки, fail-closed для действий.
+# Аудит, PEP/PDP и guardrail подключены: вход проверяется до LLM, выход —
+# до показа; при недоступном guardrail чтение продолжается, действия закрыты.
