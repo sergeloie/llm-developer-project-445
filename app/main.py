@@ -18,8 +18,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app import orchestrator, sessions
-from core import config
+from app import cards, orchestrator, sessions
+from core import config, db
 
 
 @asynccontextmanager
@@ -56,7 +56,7 @@ async def open_session(payload: dict):
         "name": session.user.name,
         "role": session.user.role,
         # TODO(права): permissions.visible_tools(session.allowlist, pool.tool_names()).
-        "visible_tools": session.pool.tool_names(),
+        "visible_tools": [t for t in session.pool.tool_names() if t != "execute_action"],
     }
 
 
@@ -102,5 +102,32 @@ async def chat(payload: dict):
     )
 
 
-# TODO(контракты): POST /api/cards/{pending_id}/decision — кнопка карточки:
-#   «да» → orchestrator.execute_pending, «нет» → отмена.
+def _find_card(session, pending_id: str):
+    active = cards.active(session)
+    if active is not None and active.pending_id == pending_id:
+        return active
+    row = db.fetchone(
+        "select pending_id, action, details, card, sub from pending_cards"
+        " where pending_id = %s and session_id = %s",
+        (pending_id, session.session_id),
+    )
+    if row is None:
+        return None
+    return cards.Card(
+        pending_id=row["pending_id"], action=row["action"],
+        details=row["details"], view=row["card"],
+        session_id=session.session_id, sub=row["sub"],
+    )
+
+
+@app.post("/api/cards/{pending_id}/decision")
+async def card_decision(pending_id: str, payload: dict):
+    """Кнопки карточки: «да» исполняет, «нет» отменяет (решение кода)."""
+    session = sessions.get(payload.get("session_id", ""))
+    if session is None:
+        return JSONResponse({"error": "неизвестная сессия"}, status_code=400)
+    card = _find_card(session, pending_id)
+    if card is None:
+        return JSONResponse({"error": "карточка не найдена"}, status_code=404)
+    text = await orchestrator.decide(session, card, str(payload.get("answer", "")))
+    return {"text": text}

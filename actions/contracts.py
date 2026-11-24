@@ -1,21 +1,88 @@
-"""Контракты действий: схемы, нормализация, таксономия ошибок.
-
-TODO(контракты):
-  1. ActionError(code, message, **hints) — отказ действия:
-     to_tool_result() → {"error": code, "detail": message, **hints}.
-  2. BUSINESS_RULE_CODES = same_tariff, tariff_not_available,
-     service_already_on/off, same_contacts — повторять бессмысленно.
-  3. Нормализация «как услышали» → точное значение:
-     normalize_tariff(raw, catalog) — unknown_tariff с подсказкой
-     available=[...]; normalize_service(raw, catalog) — unknown_service;
-     normalize_phone — 11 цифр → bad_phone с примером; normalize_email.
-"""
+"""Контракты действий: схемы, нормализация, таксономия ошибок."""
 from __future__ import annotations
 
-from pydantic import BaseModel
+import re
 
-BUSINESS_RULE_CODES = frozenset()
+BUSINESS_RULE_CODES = frozenset({
+    "same_tariff",
+    "tariff_not_available",
+    "service_already_on",
+    "service_already_off",
+    "same_contacts",
+    "nothing_to_update",
+})
 
 
 class ActionError(Exception):
-    pass
+    """Отказ действия: код, человекочитаемое сообщение и подсказки модели."""
+
+    def __init__(self, code: str, message: str, **hints) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hints = hints
+
+    def to_tool_result(self) -> dict:
+        return {"error": self.code, "detail": self.message, **self.hints}
+
+
+def _names(catalog) -> list[str]:
+    return [
+        item["name"] if isinstance(item, dict) else str(item)
+        for item in (catalog or [])
+    ]
+
+
+def _clean(raw) -> str:
+    return str(raw or "").strip().strip("\"'«»").strip()
+
+
+def normalize_tariff(raw, catalog) -> str:
+    """«как расслышали» → точное название тарифа из каталога."""
+    available = _names(catalog)
+    wanted = _clean(raw).casefold()
+    for name in available:
+        if wanted == name.casefold():
+            return name
+    raise ActionError(
+        "unknown_tariff",
+        f"Тариф {_clean(raw) or '(не указан)'} неизвестен",
+        available=available,
+    )
+
+
+def normalize_service(raw, catalog) -> str:
+    available = _names(catalog)
+    wanted = _clean(raw).casefold()
+    for name in available:
+        if wanted == name.casefold():
+            return name
+    raise ActionError(
+        "unknown_service",
+        f"Услуга {_clean(raw) or '(не указана)'} неизвестна",
+        available=available,
+    )
+
+
+def normalize_phone(raw) -> str:
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) == 10:
+        digits = "7" + digits
+    if len(digits) == 11 and digits[0] in "78":
+        return "+7" + digits[1:]
+    raise ActionError(
+        "bad_phone",
+        "Номер телефона должен содержать 11 цифр",
+        example="+7 900 111-22-33",
+    )
+
+
+def normalize_email(raw) -> str:
+    email = _clean(raw).lower()
+    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        return email
+    raise ActionError(
+        "bad_email",
+        "Почта указана некорректно",
+        example="anna@example.ru",
+    )
