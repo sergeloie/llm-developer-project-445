@@ -31,6 +31,7 @@ class Session:
     trace_id: str = ""                           # сквозной id текущего хода
     planner: object | None = None                # собирается лениво на первом ходе
     pending_card: object | None = None           # живая карточка подтверждения
+    done_card: object | None = None              # исполненная карточка (для повтора «да»)
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:8]}")
 
     def note(self, tool: str) -> None:

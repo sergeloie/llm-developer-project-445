@@ -4,8 +4,8 @@
 нестрогой схемой: строгий JSON-режим требует от малых моделей слишком
 много, план падает на валидации.
 
-TODO(аудит): в run_agent — INSERT в llm_calls: trace_id, имя агента,
-  модель, токены (result.context_wrapper.usage), латентность.
+Аудит (шаг 4): каждый запуск агента пишется в llm_calls с trace_id,
+  именем, моделью, токенами и задержкой.
 
 TODO(failover): если llm_pool.enabled() — запуск через
   llm_pool.run_with_failover, в llm_calls — фактический провайдер.
@@ -16,7 +16,7 @@ import time
 
 from agents import Agent, AgentOutputSchema, Runner
 
-from core import config
+from core import config, db
 
 
 def build_agent(name, instructions, tools=None, output_type=None):
@@ -45,10 +45,29 @@ def _arguments(raw_item) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-async def run_agent(agent, task, *, trace_id="") -> dict:
-    """Один Runner.run; возвращает доклад и разбор вызовов инструментов."""
+async def run_agent(agent, task, *, trace_id="", history=None) -> dict:
+    """Один Runner.run; возвращает доклад, структурированный выход и историю."""
     started = time.monotonic()
-    result = await Runner.run(agent, task)
+    inputs = [*history, {"role": "user", "content": task}] if history else task
+    result = await Runner.run(agent, inputs)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    try:
+        usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+        db.execute(
+            "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens, latency_ms)"
+            " values (%s, %s, %s, %s, %s, %s)",
+            (
+                trace_id or None,
+                agent.name,
+                config.MODEL_NAME or str(getattr(agent, "model", "") or ""),
+                int(getattr(usage, "input_tokens", 0) or 0),
+                int(getattr(usage, "output_tokens", 0) or 0),
+                elapsed_ms,
+            ),
+        )
+    except Exception:  # noqa: BLE001 — журнал не роняет агента
+        pass
 
     calls: dict[str, dict] = {}
     for item in result.new_items:
@@ -69,6 +88,8 @@ async def run_agent(agent, task, *, trace_id="") -> dict:
     report = final if isinstance(final, str) else str(final)
     return {
         "report": report,
+        "output": final,
+        "history": result.to_input_list() if history is not None else [],
         "tools": list(calls.values()),
         "seconds": round(time.monotonic() - started, 2),
     }

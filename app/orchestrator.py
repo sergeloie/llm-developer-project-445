@@ -12,7 +12,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 
-from app import cards, editor as editor_mod, idempotency, llm, planner, workers
+from app import audit, cards, editor as editor_mod, idempotency, llm, planner, workers
 from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -84,6 +84,32 @@ async def _escalate(session, message: str) -> str:
     return f"Передаю обращение оператору, тикет {ticket_id}." if ticket_id else "Передаю обращение оператору."
 
 
+def _audit(session, what: str, outcome: str, **fields) -> None:
+    """Запись в append-only журнал: сбой логгера не роняет ответ абоненту."""
+    try:
+        audit.append(
+            session.user.sub, what, outcome,
+            trace_id=session.trace_id or None,
+            session_id=session.session_id,
+            **fields,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _before_after(card, result: dict) -> tuple[str | None, str | None]:
+    view = card.view or {}
+    before = (
+        result.get("before") or view.get("с") or view.get("было")
+        or view.get("телефон_было") or view.get("почта_было")
+    )
+    after = (
+        result.get("after") or card.details.get("tariff") or view.get("на")
+        or view.get("станет") or view.get("телефон_станет") or view.get("почта_станет")
+    )
+    return before, after
+
+
 async def execute_pending(session, card) -> str:
     """Исполнить карточку после «да»: один ключ, один эффект."""
     key = f"{card.action}:{card.pending_id}"
@@ -100,25 +126,36 @@ async def execute_pending(session, card) -> str:
     )
     if stored.duplicate:
         cards.settle(session, card, "confirmed")
+        session.done_card = card  # повтор «да» узнаёт карточку и не идёт в LLM
+        _audit(session, card.action, "duplicate_suppressed",
+               args=card.details, idempotency_key=key, detail="повтор не исполнялся")
         return "Эта операция уже исполнена — повтор не выполнялся."
 
     result = stored.result or {}
     outcome = result.get("outcome") or result.get("error") or ""
-    if outcome in {"executed", "duplicate"}:
+    if outcome in {"executed", "duplicate", "toggled", "updated"}:
         cards.settle(session, card, "confirmed")
+        session.done_card = card
         if outcome == "duplicate":
+            _audit(session, card.action, "duplicate_suppressed",
+                   args=card.details, idempotency_key=key, detail="дубль биллинга")
             return "Эта операция уже исполнена — повтор не выполнялся."
-        return "Готово: " + _describe(card.action, result, card)
-    if outcome in {"toggled", "updated"}:
-        cards.settle(session, card, "confirmed")
+        before, after = _before_after(card, result)
+        _audit(session, card.action, "executed", args=card.details,
+               before=before, after=after, idempotency_key=key)
         return "Готово: " + _describe(card.action, result, card)
     if outcome == "daily_limit":
         cards.settle(session, card, "denied")
+        _audit(session, card.action, "server_limit", args=card.details,
+               idempotency_key=key, detail="daily_limit")
         return "Дневной лимит смен тарифа исчерпан — попробуйте завтра."
     if outcome in _business_codes():
         cards.settle(session, card, "denied")
+        _audit(session, card.action, "rejected_by_contract", args=card.details,
+               detail=str(result.get("detail") or outcome))
         return "Действие невозможно: " + str(result.get("detail") or outcome)
     # инфраструктурный сбой: карточку оставляем живой, ключ не занят
+    _audit(session, card.action, "error", args=card.details, detail=str(outcome)[:120])
     return "Не удалось выполнить действие, попробуйте ещё раз."
 
 
@@ -135,10 +172,14 @@ async def decide(session, card, answer: str) -> str:
         return await execute_pending(session, card)
     if verdict == "no":
         cards.settle(session, card, "rejected")
+        _audit(session, card.action, "rejected_by_user",
+               args={"action": card.action, "pending_id": card.pending_id})
         return "Отменяю: действие не выполнено."
     if verdict == "operator":
         text = await _escalate(session, answer)
         cards.settle(session, card, "escalated")
+        _audit(session, card.action, "escalated",
+               args={"action": card.action, "pending_id": card.pending_id}, detail=text[:80])
         return text
     return "Не расслышал ответа: скажите «да», «нет» или «оператор»."
 
@@ -148,6 +189,8 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
 
     active = cards.active(session)
+    if active is None:
+        active = getattr(session, "done_card", None)  # повтор «да» после исполнения
     if active is not None:
         verdict = cards.classify_answer(message)
         if verdict != "topic":  # «да», «нет», «оператор» — карточку обслуживает код
@@ -162,7 +205,9 @@ async def run_turn(session, message: str, emit: Emit) -> None:
 
     if session.planner is None:
         session.planner = planner.build_planner()
-    plan, history = await planner.next_plan(session.planner, session.thread, message)
+    plan, history = await planner.next_plan(
+        session.planner, session.thread, message, trace_id=session.trace_id
+    )
     session.thread = history
 
     proposed = [step.agent for step in plan.steps]

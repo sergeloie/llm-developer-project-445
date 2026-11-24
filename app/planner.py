@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agents import Runner
-
 from app import llm
 
 READ_AGENTS = ("data", "kb")
@@ -92,11 +90,10 @@ def gate(plan: Plan, session=None) -> Plan:
     return Plan(steps=kept, question=plan.question)
 
 
-async def next_plan(planner, history, message) -> tuple[Plan, list]:
+async def next_plan(planner, history, message, *, trace_id: str = "") -> tuple[Plan, list]:
     """Один вызов планировщика по истории диалога; возвращает историю хода."""
-    inputs = [*history, {"role": "user", "content": message}]
-    result = await Runner.run(planner, inputs)
-    plan = result.final_output
+    outcome = await llm.run_agent(planner, message, trace_id=trace_id, history=history)
+    plan = outcome["output"]
     if not isinstance(plan, Plan):
         plan = Plan.model_validate(plan)
-    return plan, result.to_input_list()
+    return plan, outcome["history"]
