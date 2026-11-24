@@ -44,6 +44,16 @@ CARD_TTL_SEC = int(os.environ.get("CARD_TTL_SEC", "120"))
 BUDGET_RUB = float(os.environ.get("BUDGET_RUB", "50"))
 LLM_PRICE_RUB_PER_1M = float(os.environ.get("LLM_PRICE_RUB_PER_1M", "60"))
 
+# Бонус: второй OpenAI-совместимый провайдер. Пул включается, когда заданы
+# и base_url, и модель запасного провайдера.
+SECONDARY_BASE_URL = os.environ.get("LLM_SECONDARY_BASE_URL", "")
+SECONDARY_MODEL = os.environ.get("LLM_SECONDARY_MODEL", "")
+SECONDARY_API_KEY = os.environ.get("LLM_SECONDARY_API_KEY", "none")
+SECONDARY_PRICE_RUB_PER_1M = float(
+    os.environ.get("LLM_SECONDARY_PRICE_RUB_PER_1M", os.environ.get("LLM_PRICE_RUB_PER_1M", "60"))
+)
+FAILOVER_COOLDOWN_SEC = int(os.environ.get("LLM_FAILOVER_COOLDOWN_SEC", "60"))
+
 # ── Ресурсы MCP-серверов (RFC 8707): canonical URI адресата токена ───────
 RESOURCES = {
     "crm": f"{STAND_URL}/crm",
@@ -94,6 +104,12 @@ def setup_model() -> str:
         api_key=os.environ.get("LLM_API_KEY", "none"),
         http_client=httpx.AsyncClient(trust_env=False, timeout=180),
     )
+    # Клиент-маршрутизатор встраивается на уровне SDK: агенты не знают ни о
+    # провайдере, ни о переключении. Второй провайдер добавляется в пул,
+    # когда задан в .env.
+    from app.llm_pool import setup_pool
+
+    client = setup_pool(primary_client=client, primary_model=model_name)
     set_default_openai_client(client, use_for_tracing=False)
     set_default_openai_api("chat_completions")
     set_tracing_disabled(True)

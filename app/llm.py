@@ -7,8 +7,8 @@
 Аудит (шаг 4): каждый запуск агента пишется в llm_calls с trace_id,
   именем, моделью, токенами и задержкой.
 
-TODO(failover): если llm_pool.enabled() — запуск через
-  llm_pool.run_with_failover, в llm_calls — фактический провайдер.
+Бонус: запуск идёт через llm_pool.call(); в llm_calls пишутся фактический
+  провайдер, его модель и стоимость по цене этой модели.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import time
 
 from agents import Agent, AgentOutputSchema, Runner
 
+from app import llm_pool
 from core import config, db
 
 
@@ -24,7 +25,9 @@ def build_agent(name, instructions, tools=None, output_type=None):
     kwargs = dict(
         name=name,
         instructions=instructions,
-        model=config.MODEL_NAME or config.setup_model(),
+        # SDK трактует «provider/model» как префикс провайдера; реальное имя
+        # подставляет llm_pool на уровне HTTP-клиента.
+        model=(config.MODEL_NAME or config.setup_model()).split("/")[-1],
         tools=list(tools or []),
     )
     if output_type is not None:
@@ -49,21 +52,23 @@ async def run_agent(agent, task, *, trace_id="", history=None) -> dict:
     """Один Runner.run; возвращает доклад, структурированный выход и историю."""
     started = time.monotonic()
     inputs = [*history, {"role": "user", "content": task}] if history else task
-    result = await Runner.run(agent, inputs)
+    result, provider = await llm_pool.call(lambda *_: Runner.run(agent, inputs))
+    model_used = provider.model
+    provider_name = provider.name
+    price = provider.price_rub_per_1m
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     try:
         usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cost = round((input_tokens + output_tokens) * price / 1_000_000, 6)
         db.execute(
-            "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens, latency_ms)"
-            " values (%s, %s, %s, %s, %s, %s)",
+            "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens,"
+            " latency_ms, provider, cost_rub) values (%s, %s, %s, %s, %s, %s, %s, %s)",
             (
-                trace_id or None,
-                agent.name,
-                config.MODEL_NAME or str(getattr(agent, "model", "") or ""),
-                int(getattr(usage, "input_tokens", 0) or 0),
-                int(getattr(usage, "output_tokens", 0) or 0),
-                elapsed_ms,
+                trace_id or None, agent.name, model_used, input_tokens, output_tokens,
+                elapsed_ms, provider_name, cost,
             ),
         )
     except Exception:  # noqa: BLE001 — журнал не роняет агента
@@ -92,4 +97,6 @@ async def run_agent(agent, task, *, trace_id="", history=None) -> dict:
         "history": result.to_input_list() if history is not None else [],
         "tools": list(calls.values()),
         "seconds": round(time.monotonic() - started, 2),
+        "provider": provider_name,
+        "model": model_used,
     }
