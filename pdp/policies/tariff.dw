@@ -1,21 +1,59 @@
 // Политики write-пути агента мобильного оператора (Dogwood: Cedar + temporal).
-//
-// TODO(права): написать политики «да — что да?» (схема действий — в
-// schema.cedarschema, действия Prepare / ConfirmCard / Execute):
-//
-//   1. permit Prepare — клиент с tariffs:write; guard-условия:
-//      identity-ключи (user_id/account/subscriber) в аргументах не
-//      существуют; с guardrail — ещё context.input.guard_ok.
-//   2. permit ConfirmCard — та же карточка готовилась недавно:
-//      when temporal { formerly within 1h
-//          Tel::Action::"Prepare"::request{ input.pending_id:
-//          context.input.pending_id } }.
-//   3. permit Execute — formerly within 1h ConfirmCard той же карточки.
-//   4. forbid-лимит — не более двух смен тарифа за окно сессии:
-//      count_within(24h, Execute::request{ input.action:
-//      "tariff_change" }) > 2.
-//
-// Семантика Cedar: deny by default, forbid перекрывает permit.
-// Пустая политика валидна: PDP стартует и всё запрещает (deny by
-// default) — начинайте с permit Prepare и смотрите reason'ы в
-// policy_events.
+// Всё запрещено по умолчанию: разрешает только роль клиента с tariffs:write,
+// подтверждение той же карточки и лимит в две смены тарифа за сессию.
+
+@id("prepare_write_card")
+permit (
+    principal,
+    action == Tel::Action::"Prepare",
+    resource
+)
+when {
+    context.input.role == "client"
+    && context.input.scopes.contains("tariffs:write")
+    && context.input.guard_ok == true
+};
+
+// «Да» — только по карточке, которая готовилась в этом окне.
+@id("confirm_prepared_card")
+permit (
+    principal,
+    action == Tel::Action::"ConfirmCard",
+    resource
+)
+when temporal {
+    formerly within 1h Tel::Action::"Prepare"::request{
+        input.pending_id: context.input.pending_id,
+        input.sub: context.input.sub
+    }
+};
+
+// Исполнение — только после «да» по той же карточке.
+@id("execute_confirmed_card")
+permit (
+    principal,
+    action == Tel::Action::"Execute",
+    resource
+)
+when temporal {
+    formerly within 1h Tel::Action::"ConfirmCard"::request{
+        input.pending_id: context.input.pending_id,
+        input.sub: context.input.sub
+    }
+};
+
+// Лимит: третья смена тарифа за сессию запрещена. Услуги и контакты
+// не расходуют лимит — forbid смотрит только на tariff_change.
+@id("tariff_change_session_limit")
+forbid (
+    principal,
+    action == Tel::Action::"Execute",
+    resource
+)
+when { context.input.action == "tariff_change" }
+when temporal {
+    count_within(24h, Tel::Action::"Execute"::request{
+        input.action: "tariff_change",
+        input.sub: context.input.sub
+    }) > 2
+};

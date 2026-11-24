@@ -15,7 +15,7 @@ from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
 from app import audit, cards, permissions
-from app.sessions import Session
+from app.sessions import Session, pep_of
 from core import config, db
 
 
@@ -113,6 +113,21 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
 
         if name.startswith("prepare_") and result.get("ok"):
             card = cards.create(session, result["action"], result["details"], result["view"])
+            # Политика решает, бывает ли такая карточка: без Allow она не живая.
+            decision = await pep_of(session).prepare(card)
+            if not decision.allowed:
+                cards.settle(session, card, "denied")
+                _log_tool(session, name, args, f"denied:{decision.reason}", started)
+                try:
+                    audit.append(
+                        session.user.sub, f"prepare:{card.action}", "denied",
+                        trace_id=session.trace_id or None,
+                        session_id=session.session_id,
+                        args=args, detail=decision.reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return json.dumps({"error": "denied", "reason": decision.reason}, ensure_ascii=False)
             _log_tool(session, name, args, "prepared", started)
             _log_prepare(session, result["action"], result["details"], card.pending_id)
             return json.dumps({

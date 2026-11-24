@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from app import audit, cards, editor as editor_mod, idempotency, llm, planner, workers
+from app.sessions import pep_of
 from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -165,10 +166,38 @@ def _business_codes() -> set[str]:
     return set(BUSINESS_RULE_CODES) | {"unknown_action", "bad_details"}
 
 
+DENIAL_REPLIES = {
+    "confirmation_expired": "Карточка устарела — повторите, пожалуйста, запрос.",
+    "session_limit": "Лимит смен тарифа за сессию исчерпан.",
+    "card_not_prepared": "Подтверждать нечего — повторите запрос.",
+    "confirmation_missing": "Подтверждение не найдено — повторите запрос.",
+    "confirmation_mismatch": "Подтверждение не совпало с карточкой — повторите запрос.",
+    "pdp_unavailable": "Сервис подтверждений недоступен, попробуйте позже.",
+    "guard_not_ok": "Проверка безопасности не пройдена, действие закрыто.",
+    "no_write_scope": "У вас нет права менять тариф.",
+    "role_has_no_write": "Ваша роль не позволяет менять тариф.",
+    "identity_in_args": "Действие запрещено: идентичность уже взята из токена.",
+}
+
+
+def _deny_card(session, card, reason: str) -> str:
+    state = "expired" if reason == "confirmation_expired" else "denied"
+    cards.settle(session, card, state)
+    _audit(session, card.action, state, args={"pending_id": card.pending_id}, detail=reason)
+    return DENIAL_REPLIES.get(reason, "Действие запрещено политикой.")
+
+
 async def decide(session, card, answer: str) -> str:
-    """Кнопка карточки или текст ответа: решение принимает код, не LLM."""
+    """Кнопка карточки: «да» проходит ConfirmCard и Execute в PDP."""
     verdict = cards.classify_answer(answer)
     if verdict == "yes":
+        pep = pep_of(session)
+        confirmed = await pep.confirm(card)
+        if not confirmed.allowed:
+            return _deny_card(session, card, confirmed.reason)
+        allowed = await pep.execute(card)
+        if not allowed.allowed:
+            return _deny_card(session, card, allowed.reason)
         return await execute_pending(session, card)
     if verdict == "no":
         cards.settle(session, card, "rejected")
@@ -202,6 +231,15 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         old_card_id = active.pending_id
     else:
         old_card_id = ""
+        if cards.classify_answer(message) == "yes":  # «да» без карточки — не исполняем
+            session.note("card:yes_without_card")
+            await emit({
+                "type": "reply",
+                "text": DENIAL_REPLIES["card_not_prepared"],
+                "sources": [],
+            })
+            _persist(session)
+            return
 
     if session.planner is None:
         session.planner = planner.build_planner()
