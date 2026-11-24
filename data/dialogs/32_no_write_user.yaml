@@ -1,0 +1,10 @@
+# Отказ: клиент без tariffs:write не видит prepare и не меняет тариф.
+name: 32_no_write_user
+user: boris
+turns:
+  - say: переведи меня на семейный тариф
+    expect:
+      plan_has: [tariff]
+      card: false
+      reply_contains: ["оператор"]
+      state: { tariff: Игровой, sub: u_9b1c }

@@ -1,0 +1,13 @@
+# Лимит/эскалация: живая карточка уходит оператору, тикет создан, тариф не тронут.
+name: 50_escalation_ticket
+user: anna
+turns:
+  - say: переведи меня на игровой тариф
+    expect:
+      plan_has: [tariff]
+      card: true
+  - say: оператор
+    expect:
+      card: false
+      reply_contains: ["тикет"]
+      state: { tariff: Базовый, tickets_min: 1 }

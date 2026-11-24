@@ -57,7 +57,7 @@ smoke:
 	python -X utf8 -m tests.smoke $(G)
 
 scenarios:
-	python scripts/run_scenarios.py
+	python -X utf8 scripts/run_scenarios.py
 
 reset:
 	curl -s -X POST http://127.0.0.1:8100/mock/admin/reset

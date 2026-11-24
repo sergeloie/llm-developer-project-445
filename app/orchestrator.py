@@ -98,6 +98,18 @@ def _audit(session, what: str, outcome: str, **fields) -> None:
         pass
 
 
+def _answer_kind(message: str) -> str:
+    """Короткий ответ по карточке; подстроки вроде «угу» в «услугу» не считаем."""
+    text = message.strip().casefold().strip("!.,")
+    if text in {"да", "yes", "y", "ага", "давай", "конечно", "подтверждаю", "угу"}:
+        return "yes"
+    if text in {"нет", "no", "n", "не надо", "отмена", "отменить", "стоп"}:
+        return "no"
+    if text in {"оператор", "operator", "человека", "менеджера"}:
+        return "operator"
+    return "topic"
+
+
 UNSAFE_INPUT_REPLY = "Не могу выполнить эту просьбу: похоже на попытку изменить мои правила работы."
 UNSAFE_OUTPUT_REPLY = "Ответ заблокирован проверкой безопасности — попробуйте переформулировать вопрос."
 UNSAFE_CARD_REPLY = "Карточка не найдена или истекла."
@@ -231,7 +243,7 @@ def _deny_card(session, card, reason: str) -> str:
 
 async def decide(session, card, answer: str) -> str:
     """Кнопка карточки: «да» проходит ConfirmCard и Execute в PDP."""
-    verdict = cards.classify_answer(answer)
+    verdict = _answer_kind(answer)
     if verdict == "yes":
         pep = pep_of(session)
         confirmed = await pep.confirm(card)
@@ -268,7 +280,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     if active is None:
         active = getattr(session, "done_card", None)  # повтор «да» после исполнения
     if active is not None:
-        verdict = cards.classify_answer(message)
+        verdict = _answer_kind(message)
         if verdict != "topic":  # «да», «нет», «оператор» — карточку обслуживает код
             reply = await decide(session, active, message)
             session.note(f"card:{verdict}")
@@ -278,7 +290,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         old_card_id = active.pending_id
     else:
         old_card_id = ""
-        if cards.classify_answer(message) == "yes":  # «да» без карточки — не исполняем
+        if _answer_kind(message) == "yes":  # «да» без карточки — не исполняем
             session.note("card:yes_without_card")
             await _emit_reply(session, emit, DENIAL_REPLIES["card_not_prepared"])
             _persist(session)

@@ -1,0 +1,13 @@
+# Отказ: пользователь передумал после карточки — эффектов нет.
+name: 31_reject_after_card
+user: anna
+turns:
+  - say: переведи меня на игровой тариф
+    expect:
+      plan_has: [tariff]
+      card: true
+  - say: нет
+    expect:
+      card: false
+      reply_contains: ["тменяю"]
+      state: { tariff: Базовый }

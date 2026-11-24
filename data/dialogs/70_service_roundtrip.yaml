@@ -1,0 +1,18 @@
+# Свой сценарий: услуга выключается и включается обратно — проверяем состояние моков.
+name: 70_service_roundtrip
+user: anna
+turns:
+  - say: отключи услугу Музыка
+    expect:
+      card: true
+  - say: да
+    expect:
+      reply_contains: ["отово"]
+      state: { service: { name: Музыка, enabled: false } }
+  - say: включи услугу Музыка
+    expect:
+      card: true
+  - say: да
+    expect:
+      reply_contains: ["отово"]
+      state: { service: { name: Музыка, enabled: true } }

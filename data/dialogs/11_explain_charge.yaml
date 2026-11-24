@@ -1,0 +1,10 @@
+# Успех: вопрос о списании — факты агента данных + правила из базы знаний.
+name: 11_explain_charge
+user: anna
+turns:
+  - say: объясни, почему у меня списание 440
+    expect:
+      plan_has: [data, kb]
+      card: false
+      reply_contains: ["440", "источник"]
+      state: { tariff: Базовый }
