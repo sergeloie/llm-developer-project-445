@@ -47,18 +47,27 @@ class Pep:
         }
 
     async def _call(self, path: str, payload: dict) -> Decision:
-        try:
-            async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
-                response = await client.post(f"{config.PDP_URL}{path}", json=payload)
-            if response.status_code != 200:
+        """Один запрос; при 404 (PDP перезапущен) открываем сессию заново и повторяем."""
+        for attempt in (0, 1):
+            try:
+                async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+                    response = await client.post(f"{config.PDP_URL}{path}", json=payload)
+                if response.status_code == 404 and attempt == 0:
+                    self._opened = False
+                    failed = await self._ensure_open()
+                    if failed is not None:
+                        return failed
+                    continue
+                if response.status_code != 200:
+                    return Decision(False, "pdp_unavailable")
+                body = response.json()
+            except Exception:  # noqa: BLE001 — сбой PDP не открывает write-путь
                 return Decision(False, "pdp_unavailable")
-            body = response.json()
-        except Exception:  # noqa: BLE001 — сбой PDP не открывает write-путь
-            return Decision(False, "pdp_unavailable")
-        return Decision(
-            bool(body.get("decision") == "Allow"),
-            str(body.get("reason") or ""),
-        )
+            return Decision(
+                bool(body.get("decision") == "Allow"),
+                str(body.get("reason") or ""),
+            )
+        return Decision(False, "pdp_unavailable")
 
     async def _ensure_open(self) -> Decision | None:
         if self._opened:

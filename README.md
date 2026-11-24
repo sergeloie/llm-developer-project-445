@@ -6,6 +6,7 @@
 
 Учебный проект Хекслета: https://ru.hexlet.io/programs/llm-developer
 Как это должно работать: https://files.hexlet.app/a/i3355x
+Отчёт приёмки контура: [ACCEPTANCE.md](ACCEPTANCE.md)
 
 ## Стек
 
