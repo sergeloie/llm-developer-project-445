@@ -14,7 +14,7 @@ from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
-from app import audit, cards
+from app import audit, cards, permissions
 from app.sessions import Session
 from core import config, db
 
@@ -83,6 +83,22 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
             )
         if inject_sub and "sub" not in args:
             args["sub"] = session.user.sub
+
+        # Барьер 2: допуск тройки «субъект, операция, объект» в момент вызова
+        verdict = permissions.admit(session.allowlist, name, args)
+        if not verdict.allowed:
+            _log_tool(session, name, args, f"denied:{verdict.reason}", started)
+            try:
+                audit.append(
+                    session.user.sub, name, "denied",
+                    trace_id=session.trace_id or None,
+                    session_id=session.session_id,
+                    args=args, detail=verdict.reason,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return json.dumps({"error": "denied", "reason": verdict.reason}, ensure_ascii=False)
+
         session.note(name)
         try:
             result = await session.pool.call(session.pool.resource_of(name), name, args)
@@ -116,7 +132,10 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
 
 
 def wrap_tools(session: Session, names: list[str]) -> list[FunctionTool]:
-    """Собрать обёртки для перечня имён (какие имена давать — решает код)."""
+    """Собрать обёртки: барьер 1 — модель видит только allowlist сессии."""
     known = set(session.pool.tool_names())
+    candidates = [n for n in names if n in known]
+    if session.allowlist:
+        candidates = permissions.visible_tools(session.allowlist, candidates)
     # execute_action не должен попадать в набор инструментов модели никогда
-    return [wrap_mcp_tool(session, n) for n in names if n in known and n != "execute_action"]
+    return [wrap_mcp_tool(session, n) for n in candidates if n != "execute_action"]

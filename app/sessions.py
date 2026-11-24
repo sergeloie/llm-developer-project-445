@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+from app import permissions
 from core import config, db
 from core.mcpclient import McpPool
 from core.tokens import Tokens
@@ -32,6 +33,10 @@ class Session:
     planner: object | None = None                # собирается лениво на первом ходе
     pending_card: object | None = None           # живая карточка подтверждения
     done_card: object | None = None              # исполненная карточка (для повтора «да»)
+    claims: dict = field(default_factory=dict)   # проверенные claims токена
+    allowlist: frozenset = frozenset()           # операции из claims
+    pep: object | None = None                    # клиент PDP, лениво
+    guard_state: dict = field(default_factory=lambda: {"ok": True})
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:8]}")
 
     def note(self, tool: str) -> None:
@@ -49,8 +54,13 @@ async def open_session(login: str) -> Session:
     tokens = Tokens(login)
     pool = McpPool(tokens, resource_keys=("crm", "billing", "kb", "actions"))
     await pool.connect()
+    claims = await tokens.claims("actions")
+    allowlist = permissions.allowlist_from_claims(claims)
 
-    session = Session(login=login, user=user, tokens=tokens, pool=pool)
+    session = Session(
+        login=login, user=user, tokens=tokens, pool=pool,
+        claims=claims, allowlist=allowlist,
+    )
     db.execute(
         "insert into sessions(session_id, login, sub) values (%s, %s, %s)",
         (session.session_id, login, user.sub),
@@ -61,3 +71,12 @@ async def open_session(login: str) -> Session:
 
 def get(session_id: str) -> Session | None:
     return SESSIONS.get(session_id)
+
+
+def pep_of(session: Session):
+    """PEP сессии: один клиент PDP на сессию, создаётся при первом обращении."""
+    if session.pep is None:
+        from app.pep import Pep
+
+        session.pep = Pep(session.session_id, session.claims, session.guard_state)
+    return session.pep

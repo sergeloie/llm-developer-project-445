@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app import cards, orchestrator, sessions
+from app import cards, orchestrator, permissions, sessions
 from core import config, db
 
 
@@ -55,8 +55,9 @@ async def open_session(payload: dict):
         "session_id": session.session_id,
         "name": session.user.name,
         "role": session.user.role,
-        # TODO(права): permissions.visible_tools(session.allowlist, pool.tool_names()).
-        "visible_tools": [t for t in session.pool.tool_names() if t != "execute_action"],
+        "visible_tools": permissions.visible_tools(
+            session.allowlist, session.pool.tool_names()
+        ),
     }
 
 
