@@ -101,7 +101,25 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
 
         session.note(name)
         try:
-            result = await session.pool.call(session.pool.resource_of(name), name, args)
+            if name == "create_ticket":
+                # Модель может прислать пачку параллельных вызовов: тикет
+                # один на ход, остальные получают уже созданный номер.
+                async with session.ticket_lock:
+                    if session.ticket_id:
+                        _log_tool(session, name, args, "duplicate_suppressed", started)
+                        return json.dumps({
+                            "ticket_id": session.ticket_id,
+                            "status": "open",
+                            "ticket_created": False,
+                            "next": "тикет уже создан в этом ходе; не вызывай create_ticket снова",
+                        }, ensure_ascii=False)
+                    result = await session.pool.call(
+                        session.pool.resource_of(name), name, args
+                    )
+                    if isinstance(result, dict) and result.get("ticket_id"):
+                        session.ticket_id = str(result["ticket_id"])
+            else:
+                result = await session.pool.call(session.pool.resource_of(name), name, args)
         except MCPError as e:
             data = e.data if isinstance(e.data, dict) else {}
             reason = getattr(e, "message", "tool_failed")[:60]
@@ -114,9 +132,10 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
         if name.startswith("prepare_") and result.get("ok"):
             card = cards.create(session, result["action"], result["details"], result["view"])
             # Политика решает, бывает ли такая карточка: без Allow она не живая.
-            decision = await pep_of(session).prepare(card)
+            decision = await pep_of(session).prepare(card, trace_id=session.trace_id)
             if not decision.allowed:
                 cards.settle(session, card, "denied")
+                session.note(f"prepare_denied:{decision.reason}")
                 _log_tool(session, name, args, f"denied:{decision.reason}", started)
                 try:
                     audit.append(
@@ -135,6 +154,18 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 "card": card.public_view(config.CARD_TTL_SEC),
                 "next": "перескажи карточку и спроси подтверждение «да/нет»; execute_action не вызывай",
             }, ensure_ascii=False)
+        if name == "create_ticket" and isinstance(result, dict) and result.get("ticket_id"):
+            # Эскалация — исход пути действия: вызов агента виден и в audit_log.
+            try:
+                audit.append(
+                    session.user.sub, "create_ticket", "escalated",
+                    trace_id=session.trace_id or None,
+                    session_id=session.session_id,
+                    args=_clip(args),
+                    detail=f"ticket_id={result['ticket_id']}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
         _log_tool(session, name, args, "ok", started)
         return json.dumps(result, ensure_ascii=False)
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app import llm
 
-READ_AGENTS = ("data", "kb")
+READ_AGENTS = ("data", "kb", "overview")
 ACTION_AGENTS = ("tariff", "tickets")
 
 
@@ -39,6 +39,8 @@ PLANNER_PROMPT = """Ты планировщик агентного чата мо
 - kb — правила и база знаний: условия тарифов, правила списаний, как сменить тариф,
   роуминг, услуги, контакты. Всегда нужен для вопросов «почему», «как», «какие правила»,
   «что будет, если», а также вместе с data для «почему списание 440».
+- overview — обзор абонента для оператора поддержки: профиль, тариф, услуги, баланс
+  по идентификатору абонента. Ставь только когда роль пользователя — operator.
 - tariff — просьба изменить тариф, услугу или контакты (смена тарифа, подключение услуги).
   Ставь action=true. Изменения исполняются только после карточки подтверждения.
 - tickets — жалоба, претензия, просьба позвонить оператору или открыть тикет.
@@ -75,6 +77,10 @@ def gate(plan: Plan, session=None) -> Plan:
     kept: list[Step] = []
     for step in plan.steps:
         name = (step.agent or "").strip().lower()
+        if name == "overview" and session is not None:
+            if "get_subscriber_overview" not in (session.allowlist or ()):
+                session.note("gate:dropped:overview:role_has_no_access")
+                continue
         if name in READ_AGENTS:
             kept.append(step.model_copy(update={"action": False, "agent": name}))
         elif name in ACTION_AGENTS:
@@ -90,8 +96,11 @@ def gate(plan: Plan, session=None) -> Plan:
     return Plan(steps=kept, question=plan.question)
 
 
-async def next_plan(planner, history, message, *, trace_id: str = "") -> tuple[Plan, list]:
+async def next_plan(planner, history, message, *, trace_id: str = "",
+                    role: str = "") -> tuple[Plan, list]:
     """Один вызов планировщика по истории диалога; возвращает историю хода."""
+    if role == "operator":
+        message = f"[роль пользователя: оператор поддержки]\n{message}"
     outcome = await llm.run_agent(planner, message, trace_id=trace_id, history=history)
     plan = outcome["output"]
     if not isinstance(plan, Plan):

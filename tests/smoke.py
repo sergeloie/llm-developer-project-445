@@ -4,8 +4,9 @@
     make smoke G=0                   # только стенд
 
 Группы включаются по мере готовности кода шага: 0 — стенд; 1 — backend;
-2 — action-MCP и контракты; 3 — аудит; 4 — права и PDP; 5 — guardrail;
-6 — сценарии (матрица); 8* — failover.
+2 — action-MCP и контракты; 3 — аудит; 4 — права и PDP; 5 — guardrail.
+Диалоговые сценарии (матрица) и failover проверяются отдельно:
+`make scenarios` и `scripts/run_scenarios.py`.
 """
 from __future__ import annotations
 
@@ -349,11 +350,15 @@ async def group_4_permissions() -> None:
         check("4", "policy_events_recorded", int(n["n"]) >= 8, f"rows={n['n']}")
 
     # ── refresh истёкшего токена: клиент восстанавливается сам ──
+    # Соединение открываем уже с коротким токеном и ждём его истечения:
+    # иначе старый валидный заголовок соединения маскирует 401.
     tokens2 = Tokens("boris")
+    await tokens2.get("crm")
+    await tokens2.force_short()
     pool2 = McpPool(tokens2, resource_keys=("crm",))
     await pool2.connect()
     try:
-        await tokens2.force_short()
+        await asyncio.sleep(2.2)
         res = await pool2.call("crm", "get_my_profile", {})
         check("4", "token_refresh", res.get("subscriber_id") == "u_9b1c", str(res)[:80])
     finally:

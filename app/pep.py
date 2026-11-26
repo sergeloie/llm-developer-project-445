@@ -85,31 +85,34 @@ class Pep:
         self._opened = True
         return None
 
-    async def prepare(self, card) -> Decision:
+    async def prepare(self, card, trace_id: str = "") -> Decision:
         failed = await self._ensure_open()
         if failed is not None:
             return failed
         return await self._call("/authorize", {
             "session_id": self.session_id,
+            "trace_id": trace_id or None,
             "action": "Prepare",
             "input": self._input(card),
         })
 
-    async def confirm(self, card) -> Decision:
+    async def confirm(self, card, trace_id: str = "") -> Decision:
         failed = await self._ensure_open()
         if failed is not None:
             return failed
         return await self._call("/confirm", {
             "session_id": self.session_id,
+            "trace_id": trace_id or None,
             "input": self._input(card),
         })
 
-    async def execute(self, card) -> Decision:
+    async def execute(self, card, trace_id: str = "") -> Decision:
         failed = await self._ensure_open()
         if failed is not None:
             return failed
         return await self._call("/authorize", {
             "session_id": self.session_id,
+            "trace_id": trace_id or None,
             "action": "Execute",
             "input": self._input(card),
         })

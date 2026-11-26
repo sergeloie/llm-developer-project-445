@@ -3,13 +3,13 @@
     uvicorn --factory guardrail.service:build_app --host 127.0.0.1 --port 8300
 
 RULE-движок — лабораторная эвристика на детерминированных маркерах атак
-стенда. GUARDRAIL_MODEL=1 включает открытый классификатор, если он
-установлен; без зависимостей сервис остаётся на RULE. Недоступность —
-не крах контура: оркестратор решает сам fail-closed для действий.
+стенда. Внешний классификатор (HiveTraceGuard-Pro из описания шага) в
+контур не установлен, поэтому единственный движок — RULE; флаг
+GUARDRAIL_MODEL оставлен только для совместимости и честно игнорируется.
+Недоступность — не крах контура: оркестратор решает сам fail-closed для
+действий.
 """
 from __future__ import annotations
-
-import os
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -50,17 +50,6 @@ def rule_check(text: str, mode: str) -> dict:
 
 
 def check_text(text: str, mode: str) -> dict:
-    if os.environ.get("GUARDRAIL_MODEL") == "1":
-        try:
-            from guardrail.model import classify  # type: ignore
-
-            verdict, category = classify(text, mode=mode)
-            return {
-                "verdict": verdict, "category": category,
-                "engine": "model", "mode": mode,
-            }
-        except Exception:  # noqa: BLE001 — модель Optional, RULE всегда подстраховывает
-            pass
     return rule_check(text, mode)
 
 

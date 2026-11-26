@@ -20,7 +20,8 @@ from app import llm_pool
 from core import config, db
 
 
-def build_agent(name, instructions, tools=None, output_type=None):
+def build_agent(name, instructions, tools=None, output_type=None,
+                tool_use_behavior=None, model_settings=None):
     """Агент с фиксированным набором инструментов (allowlist агента)."""
     kwargs = dict(
         name=name,
@@ -32,6 +33,10 @@ def build_agent(name, instructions, tools=None, output_type=None):
     )
     if output_type is not None:
         kwargs["output_type"] = AgentOutputSchema(output_type, strict_json_schema=False)
+    if tool_use_behavior is not None:
+        kwargs["tool_use_behavior"] = tool_use_behavior
+    if model_settings is not None:
+        kwargs["model_settings"] = model_settings
     return Agent(**kwargs)
 
 

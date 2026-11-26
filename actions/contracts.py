@@ -37,13 +37,36 @@ def _clean(raw) -> str:
     return str(raw or "").strip().strip("\"'«»").strip()
 
 
-def normalize_tariff(raw, catalog) -> str:
-    """«как расслышали» → точное название тарифа из каталога."""
-    available = _names(catalog)
+# Служебные слова, которые модель добавляет к названию: «на игровой тариф»,
+# «услуга Музыка». Их снимаем до сравнения с каталогом.
+TARIFF_NOISE = frozenset({"на", "тариф", "тарифа", "тарифу", "тарифом", "тарифе", "тарифы"})
+SERVICE_NOISE = frozenset({
+    "услуга", "услугу", "услуги", "услугой", "услуге", "услуг",
+    "подключить", "подключи", "отключить", "отключи",
+    "включить", "включи", "выключить", "выключи",
+})
+
+
+def _match(raw, available: list[str], noise: frozenset[str]) -> str | None:
     wanted = _clean(raw).casefold()
     for name in available:
         if wanted == name.casefold():
             return name
+    words = [word for word in re.findall(r"[\w-]+", wanted) if word not in noise]
+    candidate = " ".join(words)
+    if candidate:
+        for name in available:
+            if candidate == name.casefold():
+                return name
+    return None
+
+
+def normalize_tariff(raw, catalog) -> str:
+    """«как расслышали» → точное название тарифа из каталога."""
+    available = _names(catalog)
+    matched = _match(raw, available, TARIFF_NOISE)
+    if matched is not None:
+        return matched
     raise ActionError(
         "unknown_tariff",
         f"Тариф {_clean(raw) or '(не указан)'} неизвестен",
@@ -53,10 +76,9 @@ def normalize_tariff(raw, catalog) -> str:
 
 def normalize_service(raw, catalog) -> str:
     available = _names(catalog)
-    wanted = _clean(raw).casefold()
-    for name in available:
-        if wanted == name.casefold():
-            return name
+    matched = _match(raw, available, SERVICE_NOISE)
+    if matched is not None:
+        return matched
     raise ActionError(
         "unknown_service",
         f"Услуга {_clean(raw) or '(не указана)'} неизвестна",

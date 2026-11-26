@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -40,11 +41,15 @@ def _sources(tools: list[dict]) -> list[str]:
     return found
 
 
-def _dropped(before: list[str], after: list[str]) -> list[dict]:
+def _dropped(before: list[str], after: list[str], session=None) -> list[dict]:
     """Шаги, которые гейт или код не пустили в исполнение."""
     missing = Counter(before) - Counter(after)
     result = []
     for name in missing.elements():
+        if (name == "overview" and session is not None
+                and "get_subscriber_overview" not in (session.allowlist or ())):
+            result.append({"agent": name, "why": "role_has_no_access"})
+            continue
         known = name in planner.READ_AGENTS or name in planner.ACTION_AGENTS
         result.append({
             "agent": name,
@@ -61,6 +66,31 @@ def _persist(session) -> None:
         )
     except Exception:  # noqa: BLE001 — сбой журнала не роняет ответ абоненту
         pass
+
+
+def _persist_plan(session, plan, gated, dropped: list[dict]) -> None:
+    """План хода отдельной записью с trace_id: цепочка восстанавливается по нему."""
+    try:
+        db.execute(
+            "insert into turn_plans(trace_id, session_id, plan, gated, dropped)"
+            " values (%s, %s, %s, %s, %s)",
+            (
+                session.trace_id or None,
+                session.session_id,
+                json.dumps(plan.model_dump(), ensure_ascii=False),
+                json.dumps([step.model_dump() for step in gated.steps], ensure_ascii=False),
+                json.dumps(dropped, ensure_ascii=False),
+            ),
+        )
+    except Exception:  # noqa: BLE001 — журнал не роняет ход
+        pass
+
+
+def new_trace_id(session) -> str:
+    """Новый trace_id на ход: и чат, и кнопка карточки начинают ход заново."""
+    session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+    session.ticket_id = ""  # тикет создаётся один раз за ход
+    return session.trace_id
 
 
 def _describe(action: str, result: dict, card) -> str:
@@ -82,7 +112,11 @@ async def _escalate(session, message: str) -> str:
         "subject": "Эскалация из чата", "note": message,
     })
     ticket_id = ticket.get("ticket_id", "") if isinstance(ticket, dict) else ""
-    return f"Передаю обращение оператору, тикет {ticket_id}." if ticket_id else "Передаю обращение оператору."
+    if ticket_id:
+        _audit(session, "create_ticket", "escalated",
+               args={"subject": "Эскалация из чата"}, detail=f"ticket_id={ticket_id}")
+        return f"Передаю обращение оператору, тикет {ticket_id}."
+    return "Передаю обращение оператору."
 
 
 def _audit(session, what: str, outcome: str, **fields) -> None:
@@ -98,14 +132,26 @@ def _audit(session, what: str, outcome: str, **fields) -> None:
         pass
 
 
+def _mentions(text: str, phrases) -> bool:
+    """Слово или фраза целиком: «угу» внутри «услугу» ответом не считается."""
+    return any(
+        re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text)
+        for phrase in phrases
+    )
+
+
 def _answer_kind(message: str) -> str:
-    """Короткий ответ по карточке; подстроки вроде «угу» в «услугу» не считаем."""
+    """Короткий ответ по карточке единым код-классификатором `cards`.
+
+    Набор формулировок берём у каркаса (`cards.YES/NO/OPERATOR`), но
+    сравниваем слова целиком: иначе «подключи услугу» ловится как «угу».
+    """
     text = message.strip().casefold().strip("!.,")
-    if text in {"да", "yes", "y", "ага", "давай", "конечно", "подтверждаю", "угу"}:
+    if _mentions(text, cards.YES):
         return "yes"
-    if text in {"нет", "no", "n", "не надо", "отмена", "отменить", "стоп"}:
+    if _mentions(text, cards.NO):
         return "no"
-    if text in {"оператор", "operator", "человека", "менеджера"}:
+    if _mentions(text, cards.OPERATOR):
         return "operator"
     return "topic"
 
@@ -115,7 +161,7 @@ UNSAFE_OUTPUT_REPLY = "Ответ заблокирован проверкой б
 UNSAFE_CARD_REPLY = "Карточка не найдена или истекла."
 
 
-async def _guard_input(session, message: str) -> bool:
+async def guard_input(session, message: str) -> bool:
     """Проверка реплики до LLM. False — ход не начинается."""
     verdict = await guardrail_client.check(message, mode="input")
     if not verdict.available:
@@ -214,6 +260,21 @@ async def execute_pending(session, card) -> str:
     return "Не удалось выполнить действие, попробуйте ещё раз."
 
 
+def _ticket_id(runs: list[dict]) -> str:
+    """Номер тикета из результата create_ticket в докладах агентов."""
+    for run in runs:
+        for call in run.get("tools") or []:
+            output = call.get("output")
+            if isinstance(output, str):
+                try:
+                    output = json.loads(output)
+                except (TypeError, ValueError):
+                    continue
+            if isinstance(output, dict) and output.get("ticket_id"):
+                return str(output["ticket_id"])
+    return ""
+
+
 def _business_codes() -> set[str]:
     from actions.contracts import BUSINESS_RULE_CODES
 
@@ -241,15 +302,31 @@ def _deny_card(session, card, reason: str) -> str:
     return DENIAL_REPLIES.get(reason, "Действие запрещено политикой.")
 
 
-async def decide(session, card, answer: str) -> str:
-    """Кнопка карточки: «да» проходит ConfirmCard и Execute в PDP."""
+async def decide(session, card, answer: str, *, live: bool = True) -> str:
+    """Ответ по карточке: «да» проходит ConfirmCard и Execute в PDP.
+
+    `live=False` — карточка уже исполнена (done_card). Отменить исполненное
+    нельзя: «нет» не пишет rejected_by_user, «да» упирается в идемпотентность.
+    """
     verdict = _answer_kind(answer)
+    if not live:
+        if verdict == "yes":
+            return await execute_pending(session, card)
+        if verdict == "no":
+            session.done_card = None
+            session.note("done_card:no")
+            return "Это действие уже исполнено — отменять нечего."
+        if verdict == "operator":
+            session.done_card = None
+            session.note("done_card:operator")
+            return await _escalate(session, answer)
+        return "Не расслышал ответа: скажите «да», «нет» или «оператор»."
     if verdict == "yes":
         pep = pep_of(session)
-        confirmed = await pep.confirm(card)
+        confirmed = await pep.confirm(card, trace_id=session.trace_id)
         if not confirmed.allowed:
             return _deny_card(session, card, confirmed.reason)
-        allowed = await pep.execute(card)
+        allowed = await pep.execute(card, trace_id=session.trace_id)
         if not allowed.allowed:
             return _deny_card(session, card, allowed.reason)
         return await execute_pending(session, card)
@@ -269,16 +346,15 @@ async def decide(session, card, answer: str) -> str:
 
 async def run_turn(session, message: str, emit: Emit) -> None:
     """Один ход: SSE-события plan → card|reply."""
-    session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+    new_trace_id(session)
 
-    if not await _guard_input(session, message):
+    if not await guard_input(session, message):
         await _emit_reply(session, emit, UNSAFE_INPUT_REPLY)
         _persist(session)
         return
 
+    turn_notes = len(session.trace)
     active = cards.active(session)
-    if active is None:
-        active = getattr(session, "done_card", None)  # повтор «да» после исполнения
     if active is not None:
         verdict = _answer_kind(message)
         if verdict != "topic":  # «да», «нет», «оператор» — карточку обслуживает код
@@ -290,6 +366,16 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         old_card_id = active.pending_id
     else:
         old_card_id = ""
+        done = session.done_card  # исполненная карточка: повтор «да» и запрет отмены
+        if done is not None:
+            verdict = _answer_kind(message)
+            if verdict != "topic":
+                reply = await decide(session, done, message, live=False)
+                session.note(f"done_card:{verdict}")
+                await _emit_reply(session, emit, reply)
+                _persist(session)
+                return
+            session.done_card = None
         if _answer_kind(message) == "yes":  # «да» без карточки — не исполняем
             session.note("card:yes_without_card")
             await _emit_reply(session, emit, DENIAL_REPLIES["card_not_prepared"])
@@ -299,18 +385,20 @@ async def run_turn(session, message: str, emit: Emit) -> None:
     if session.planner is None:
         session.planner = planner.build_planner()
     plan, history = await planner.next_plan(
-        session.planner, session.thread, message, trace_id=session.trace_id
+        session.planner, session.thread, message, trace_id=session.trace_id,
+        role=session.user.role,
     )
     session.thread = history
 
     proposed = [step.agent for step in plan.steps]
     gated = planner.gate(plan, session=session)
     kept = [step.agent for step in gated.steps]
-    dropped = _dropped(proposed, kept)
+    dropped = _dropped(proposed, kept, session)
     for item in dropped:
         if item["why"] == "no_worker_for_agent":
             session.note(f"gate:dropped:{item['agent']}:{item['why']}")
 
+    _persist_plan(session, plan, gated, dropped)
     session.note(f"plan:{','.join(kept) or 'empty'}")
     await emit({
         "type": "plan",
@@ -347,6 +435,23 @@ async def run_turn(session, message: str, emit: Emit) -> None:
             "seconds": outcome["seconds"],
         })
         session.note(f"{step.agent}:tools={len(outcome['tools'])}")
+
+    # Действие закрыто политикой из-за guardrail: отвечает код, а не модель,
+    # иначе LLM пересказывает сырой JSON и придумывает цены.
+    if "prepare_denied:guard_not_ok" in session.trace[turn_notes:]:
+        session.note("reply:guard_not_ok")
+        await _emit_reply(session, emit, DENIAL_REPLIES["guard_not_ok"])
+        _persist(session)
+        return
+
+    # Чистая эскалация: тикет уже создан кодом-инструментом, ответ не отдаём
+    # модели — иначе она пересказывает JSON и путает номер обращения.
+    ticket_id = _ticket_id(runs)
+    if ticket_id and kept == ["tickets"]:
+        session.note("reply:ticket")
+        await _emit_reply(session, emit, f"Передаю обращение оператору, тикет {ticket_id}.")
+        _persist(session)
+        return
 
     fresh = cards.active(session)
     if fresh is not None and fresh.pending_id != old_card_id:

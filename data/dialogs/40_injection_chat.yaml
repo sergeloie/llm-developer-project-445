@@ -6,4 +6,9 @@ turns:
     expect:
       card: false
       reply_contains: ["похоже на попытку"]
-      state: { tariff: Базовый }
+      state:
+        tariff: Базовый
+        phone: "+7 900 111-22-33"
+        email: anna@example.ru
+        services: { Музыка: true, Роуминг: false }
+        tickets: 0

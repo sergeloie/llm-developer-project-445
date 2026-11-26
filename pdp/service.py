@@ -58,12 +58,13 @@ TARIFF_CHANGE_LIMIT = 2  # для синтеза reason; само число с�
 IDENTITY_KEYS = ("user_id", "account", "subscriber", "msisdn")
 
 
-def _audit(session_id: str, sub: str, action: str, decision: str, reason: str) -> None:
+def _audit(session_id: str, sub: str, action: str, decision: str, reason: str,
+           trace_id: str | None = None) -> None:
     try:
         db.execute(
-            "insert into policy_events(session_id, sub, action, decision, reason)"
-            " values (%s, %s, %s, %s, %s)",
-            (session_id, sub, action, decision, reason),
+            "insert into policy_events(session_id, trace_id, sub, action, decision, reason)"
+            " values (%s, %s, %s, %s, %s, %s)",
+            (session_id, trace_id, sub, action, decision, reason),
         )
     except Exception:  # noqa: BLE001 — журнал решений не должен валить сервис
         pass
@@ -76,7 +77,7 @@ class Session:
     authorizer: object = None
     cards: dict[str, dict] = field(default_factory=dict)        # pending_id → {action, ts}
     confirmations: dict[str, dict] = field(default_factory=dict)
-    execute_requests: int = 0
+    tariff_changes: int = 0  # реально разрешённых смен тарифа за сессию
     last_seen: float = field(default_factory=time.monotonic)
 
 
@@ -107,26 +108,27 @@ class PolicyService:
         s.last_seen = time.monotonic()
         return s
 
-    def _authorize(self, s: Session, action: str, payload: dict) -> dict:
+    def _authorize(self, s: Session, action: str, payload: dict,
+                   trace_id: str | None = None) -> dict:
         verdict = s.authorizer.authorize_request(
             f"Tel::Action::{action}", self._principal(s), self._resource(), payload
         )
         decision = "Allow" if verdict == "Allow" else "Deny"
         reason = "" if decision == "Allow" else self._explain(s, action, payload)
-        _audit(s.session_id, s.subject["sub"], action, decision, reason)
+        _audit(s.session_id, s.subject["sub"], action, decision, reason, trace_id)
         return {"decision": decision, "reason": reason}
 
-    def prepare(self, session_id: str, payload: dict) -> dict:
+    def prepare(self, session_id: str, payload: dict, trace_id: str | None = None) -> dict:
         """Prepare: решение политики; Allow фиксирует карточку в журнале."""
         s = self._session(session_id)
-        result = self._authorize(s, "Prepare", payload)
+        result = self._authorize(s, "Prepare", payload, trace_id)
         if result["decision"] == "Allow":
             s.cards[payload["pending_id"]] = {
                 "action": payload.get("action"), "ts": time.monotonic(),
             }
         return result
 
-    def confirm(self, session_id: str, payload: dict) -> dict:
+    def confirm(self, session_id: str, payload: dict, trace_id: str | None = None) -> dict:
         """«Да» по карточке: сервисные факты → политика → событие в историю.
 
         Событие запроса пишется в историю политики даже при Deny — поэтому
@@ -134,29 +136,40 @@ class PolicyService:
         без подготовленной карточки — не факт, и фантома в истории быть
         не должно. Живые события не несут таймстемпов, окно formerly
         Prepare в live не закрывается — время жизни карточки проверяет
-        сервис.
+        сервис. Журнал policy_events пишется ровно один раз на запрос:
+        _authorize уже пишет строку решения.
         """
         s = self._session(session_id)
         pending_id = payload.get("pending_id")
         card = s.cards.get(pending_id)
         if card is None:
             result = {"decision": "Deny", "reason": "card_not_prepared"}
+            _audit(s.session_id, s.subject["sub"], "ConfirmCard",
+                   result["decision"], result["reason"], trace_id)
         elif time.monotonic() - card["ts"] > CARD_TTL_SEC:
             result = {"decision": "Deny", "reason": "confirmation_expired"}
+            _audit(s.session_id, s.subject["sub"], "ConfirmCard",
+                   result["decision"], result["reason"], trace_id)
         else:
-            result = self._authorize(s, "ConfirmCard", payload)
+            result = self._authorize(s, "ConfirmCard", payload, trace_id)
             if result["decision"] == "Allow":
                 s.confirmations[pending_id] = {
                     "action": payload.get("action"), "ts": time.monotonic(),
                 }
-        _audit(s.session_id, s.subject["sub"], "ConfirmCard", result["decision"], result["reason"])
         return result
 
-    def execute(self, session_id: str, payload: dict) -> dict:
-        """Execute: решение политики (окно ConfirmCard + лимит — forbid)."""
+    def execute(self, session_id: str, payload: dict, trace_id: str | None = None) -> dict:
+        """Execute: решение политики (окно ConfirmCard + лимит — forbid).
+
+        Лимит считает политика, но факт «сколько смен тарифа уже разрешено»
+        даёт сервис: отклонённый Execute не расходует лимит.
+        """
         s = self._session(session_id)
-        s.execute_requests += 1
-        return self._authorize(s, "Execute", payload)
+        payload = {**payload, "tariff_changes_done": s.tariff_changes}
+        result = self._authorize(s, "Execute", payload, trace_id)
+        if result["decision"] == "Allow" and payload.get("action") == "tariff_change":
+            s.tariff_changes += 1
+        return result
 
     def _explain(self, s: Session, action: str, payload: dict) -> str:
         """Reason у Deny: биндинг отдаёт только строку, причину называет сервис."""
@@ -173,7 +186,8 @@ class PolicyService:
                 return "card_not_prepared"
             return "confirmation_mismatch"
         if action == "Execute":
-            if s.execute_requests > TARIFF_CHANGE_LIMIT:
+            if (payload.get("action") == "tariff_change"
+                    and s.tariff_changes >= TARIFF_CHANGE_LIMIT):
                 return "session_limit"
             if payload.get("pending_id") not in s.confirmations:
                 return "confirmation_missing"
@@ -206,16 +220,24 @@ async def open_session(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "session_id": session_id})
 
 
+def _input(body: dict) -> dict:
+    """Поля контракта WriteInput: недостающий факт лимита — ноль, не 500."""
+    payload = dict(body.get("input", {}))
+    payload.setdefault("tariff_changes_done", 0)
+    return payload
+
+
 async def authorize(request: Request) -> JSONResponse:
     body = await request.json()
     action = body.get("action", "")
     if action not in ("Prepare", "Execute"):
         return JSONResponse({"error": "unknown_action"}, status_code=400)
+    trace_id = body.get("trace_id")
     try:
         if action == "Prepare":
-            result = SERVICE.prepare(body["session_id"], body.get("input", {}))
+            result = SERVICE.prepare(body["session_id"], _input(body), trace_id)
         else:
-            result = SERVICE.execute(body["session_id"], body.get("input", {}))
+            result = SERVICE.execute(body["session_id"], _input(body), trace_id)
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     return JSONResponse(result)
@@ -224,7 +246,7 @@ async def authorize(request: Request) -> JSONResponse:
 async def confirm(request: Request) -> JSONResponse:
     body = await request.json()
     try:
-        result = SERVICE.confirm(body["session_id"], body.get("input", {}))
+        result = SERVICE.confirm(body["session_id"], _input(body), body.get("trace_id"))
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     return JSONResponse(result)

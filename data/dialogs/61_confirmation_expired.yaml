@@ -1,0 +1,20 @@
+# Отказ: «да» после TTL карточки получает отказ, тариф не меняется.
+# Сценарий ждёт CARD_TTL_SEC + 2 секунды между репликами.
+name: 61_confirmation_expired
+user: anna
+turns:
+  - say: переведи меня на семейный тариф
+    expect:
+      plan_has: [tariff]
+      card: true
+  - say: да
+    wait_seconds: card_ttl_plus
+    expect:
+      card: false
+      reply_contains: ["Карточка устарела"]
+      state:
+        tariff: Базовый
+        phone: "+7 900 111-22-33"
+        email: anna@example.ru
+        services: { Музыка: true, Роуминг: false }
+        tickets: 0

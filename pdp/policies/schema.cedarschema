@@ -12,6 +12,7 @@ namespace Tel {
         action: String,       // какое действие: tariff_change | service_toggle | contacts_update
         pending_id: String,   // идентификатор карточки подтверждения
         details: String,      // аргументы действия — JSON-строка (для политики непрозрачны)
+        tariff_changes_done: Long, // сколько смен тарифа уже разрешено в сессии
         guard_ok: Bool,    // verdikt guardrail-сервиса на этом ходу (fail-closed: false)
         sub: String,
         role: String,

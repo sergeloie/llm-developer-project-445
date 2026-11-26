@@ -10,20 +10,64 @@
 
 ## Стек
 
-- Python
+- Python 3.12, FastAPI, OpenAI Agents SDK
+- Postgres + pgvector (Docker Compose)
+- MCP-серверы с JWT (RFC 8707)
+- Dogwood (Cedar) как PDP, guardrail-сервис
+- LLM: любой OpenAI-совместимый API, локально — LM Studio
 
 ## Установка
 
-<!-- Опишите установку: клонирование, зависимости, переменные окружения -->
+Нужны Python 3.12, Docker и запущенный OpenAI-совместимый LLM
+(например, LM Studio на `http://127.0.0.1:1234/v1`).
 
 ```bash
 git clone https://github.com/sergeloie/llm-developer-project-445.git
 cd llm-developer-project-445
+cp .env.example .env      # Windows: copy .env.example .env
 ```
+
+В `.env` укажите `LLM_BASE_URL` и `LLM_MODEL` вашей модели. Остальные
+переменные (порты, `PG_DSN`, TTL) можно оставить по умолчанию.
+
+```bash
+make install              # зависимости из requirements.txt
+make infra                # Postgres + pgvector в Docker (:5434)
+make migrate              # схема db/*.sql
+make seed                 # демо-данные и база знаний
+```
+
+Всё сразу: `make infra && make setup` (infra + install + migrate + seed).
 
 ## Использование
 
-<!-- Добавьте примеры запуска и запись asciinema — именно это смотрит работодатель -->
+Пять процессов контура запускаются в отдельных терминалах:
+
+```bash
+make stand                # :8100  issuer, read-MCP, моки, веб-чат
+make actions              # :8220  action-MCP
+make pdp                  # :9100  PDP (Dogwood)
+make guardrail            # :8300  guardrail
+make api                  # :8000  backend/оркестратор
+```
+
+Откройте чат: <http://127.0.0.1:8100>. Демо-пользователи: `anna`
+(клиент с правом менять тариф), `boris` (только чтение), `olga`
+(оператор поддержки). Страница оператора: <http://127.0.0.1:8100/operator.html>.
+
+Пример диалога: «переведи меня на игровой тариф» → карточка → «да».
+Повторное «да» не исполняет действие второй раз.
+
+Проверки:
+
+```bash
+make smoke                # группы 0–5, без модели
+make smoke G=4            # одна группа
+make scenarios            # матрица диалогов на живой модели
+make reset                # вернуть моки в демо-состояние
+```
+
+Отчёт приёмки контура — [ACCEPTANCE.md](ACCEPTANCE.md).
 
 ---
 

@@ -6,9 +6,19 @@ turns:
     expect:
       plan_has: [kb]
       card: false
-      state: { tariff: Базовый }
+      state:
+        tariff: Базовый
+        phone: "+7 900 111-22-33"
+        email: anna@example.ru
+        services: { Музыка: true, Роуминг: false }
+        tickets: 0
   - say: да
     expect:
       card: false
       reply_contains: ["Подтверждать нечего"]
-      state: { tariff: Базовый }
+      state:
+        tariff: Базовый
+        phone: "+7 900 111-22-33"
+        email: anna@example.ru
+        services: { Музыка: true, Роуминг: false }
+        tickets: 0

@@ -82,22 +82,32 @@ async def check_expectations(c: httpx.AsyncClient, scenario: dict, turn_events: 
             return False, f"в ответе лишнее «{needle}»"
 
     state = expect.get("state", {}) or {}
+    sub = state.get("sub", "u_4f2a")
+    profile = (await c.get(f"{config.STAND_URL}/mock/crm/subscriber?sub={sub}")).json()
     if "tariff" in state:
-        sub = state.get("sub", "u_4f2a")
-        r = await c.get(f"{config.STAND_URL}/mock/crm/subscriber?sub={sub}")
-        actual = r.json().get("tariff")
+        actual = profile.get("tariff")
         if actual != state["tariff"]:
             return False, f"тариф {sub}: {actual}, ожидался {state['tariff']}"
+    for field in ("phone", "email"):
+        if field in state and profile.get(field) != state[field]:
+            return False, f"{field} {sub}: {profile.get(field)}, ожидался {state[field]}"
+    services = []
     if "service" in state:
-        svc = state["service"]
-        r = await c.get(f"{config.STAND_URL}/mock/crm/subscriber?sub=u_4f2a")
-        row = next((s for s in r.json().get("services", []) if s["service"] == svc["name"]), None)
+        services.append(state["service"])
+    services.extend(
+        {"name": name, "enabled": enabled}
+        for name, enabled in (state.get("services") or {}).items()
+    )
+    for svc in services:
+        row = next((s for s in profile.get("services", []) if s["service"] == svc["name"]), None)
         actual = row["enabled"] if row else False
         if actual != svc["enabled"]:
             return False, f"услуга {svc['name']}={actual}, ожидалось {svc['enabled']}"
-    if "tickets_min" in state:
-        r = await c.get(f"{config.STAND_URL}/mock/tickets?sub=u_4f2a")
-        if len(r.json().get("tickets", [])) < state["tickets_min"]:
+    if "tickets" in state or "tickets_min" in state:
+        tickets = (await c.get(f"{config.STAND_URL}/mock/tickets?sub={sub}")).json().get("tickets", [])
+        if "tickets" in state and len(tickets) != state["tickets"]:
+            return False, f"тикетов {len(tickets)}, ожидалось {state['tickets']}"
+        if "tickets_min" in state and len(tickets) < state["tickets_min"]:
             return False, f"тикетов меньше {state['tickets_min']}"
     return True, ""
 
@@ -112,6 +122,11 @@ async def run_scenario(c: httpx.AsyncClient, path: Path) -> None:
 
     all_events: list[dict] = []
     for turn in scenario["turns"]:
+        wait = turn.get("wait_seconds")
+        if wait == "card_ttl_plus":
+            await asyncio.sleep(config.CARD_TTL_SEC + 2)
+        elif wait:
+            await asyncio.sleep(float(wait))
         events = await chat_turn(c, session_id, turn["say"])
         all_events.extend(events)
         ok, why = await check_expectations(c, turn, events)

@@ -6,7 +6,8 @@
   POST /api/chat                         {"session_id", "message"} → SSE-поток хода
   POST /api/cards/{pending_id}/decision  подтверждение карточки (с контрактов)
 
-События SSE хода: plan / card / reply / error / done.
+События SSE хода: plan / card / reply / error. Терминальный маркер `__done__`
+закрывает поток, но клиенту не отправляется.
 """
 from __future__ import annotations
 
@@ -24,8 +25,9 @@ from core import config, db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # setup_model() сам собирает пул провайдеров (core.config → llm_pool.setup_pool):
+    # отдельная инициализация failover в lifespan не нужна.
     config.setup_model()
-    # TODO(failover): llm_pool.setup_pool(), если задан LLM_SECONDARY_BASE_URL.
     yield
 
 
@@ -131,7 +133,12 @@ async def card_decision(pending_id: str, payload: dict):
     card = _find_card(session, pending_id)
     if card is None:
         return JSONResponse({"text": orchestrator.UNSAFE_CARD_REPLY}, status_code=404)
-    text = await orchestrator.decide(session, card, str(payload.get("answer", "")))
+    answer = str(payload.get("answer", ""))
+    # Кнопка — тоже ход: свой trace_id и проверка input до «да».
+    orchestrator.new_trace_id(session)
+    if not await orchestrator.guard_input(session, answer):
+        return {"text": orchestrator.UNSAFE_INPUT_REPLY}
+    text = await orchestrator.decide(session, card, answer)
     verdict = await guardrail_client.check(text, mode="output")
     if not verdict.available:
         session.guard_state["ok"] = False

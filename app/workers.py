@@ -28,6 +28,10 @@ CATALOG: dict = {
         "title": "Агент эскалации",
         "tools": ["create_ticket"],
     },
+    "overview": {
+        "title": "Агент обзора абонента (оператор)",
+        "tools": ["get_subscriber_overview"],
+    },
 }
 
 DATA_PROMPT = """Ты агент данных абонента мобильного оператора. Доложи факты по-русски,
@@ -70,8 +74,14 @@ TARIFF_NO_PREPARE_PROMPT = """Ты агент изменений тарифа, �
 не можешь выполнить просьбу, и предложи обратиться к оператору."""
 
 TICKETS_PROMPT = """Ты агент эскалации мобильного оператора. Без уточняющих вопросов
-сразу вызови create_ticket: subject — короткая тема обращения, note — суть просьбы абонента.
-После вызова скажи, что обращение передано оператору, и назови номер тикета."""
+вызови create_ticket ровно один раз: subject — короткая тема обращения, note — суть просьбы
+абонента. Повторно инструмент не вызывай: после результата скажи, что обращение передано
+оператору, и назови номер тикета."""
+
+OVERVIEW_PROMPT = """Ты агент обзора абонента для оператора поддержки. Вызови
+get_subscriber_overview с идентификатором абонента из задачи и доложи по-русски
+только то, что вернул инструмент: имя и тариф. Не выдумывай баланс и услуги,
+которых нет в ответе. Операций записи не предлагай и не выполняй."""
 
 
 def build_workers(session, agent_ids: tuple[str, ...] = ("data", "kb")) -> dict:
@@ -90,7 +100,17 @@ def build_workers(session, agent_ids: tuple[str, ...] = ("data", "kb")) -> dict:
             )
         elif name == "tickets":
             prompt = TICKETS_PROMPT
+        elif name == "overview":
+            prompt = OVERVIEW_PROMPT
         else:
             prompt = DATA_PROMPT if name == "data" else KB_PROMPT
-        workers[name] = llm.build_agent(name, prompt, tools=tools)
+        extra = {}
+        if name == "tickets":
+            # Тикет неидемпотентен: один успешный create_ticket завершает
+            # агента. Иначе малая модель зацикливается и создаёт десятки.
+            from agents import ModelSettings
+
+            extra["tool_use_behavior"] = {"stop_at_tool_names": ["create_ticket"]}
+            extra["model_settings"] = ModelSettings(parallel_tool_calls=False)
+        workers[name] = llm.build_agent(name, prompt, tools=tools, **extra)
     return workers

@@ -46,16 +46,15 @@ when temporal {
 
 // Лимит: третья смена тарифа за сессию запрещена. Услуги и контакты
 // не расходуют лимит — forbid смотрит только на tariff_change.
+// tariff_changes_done — факт сервиса: сколько Execute уже разрешено.
+// Отклонённые запросы (confirmation_missing и т.п.) лимит не тратят.
 @id("tariff_change_session_limit")
 forbid (
     principal,
     action == Tel::Action::"Execute",
     resource
 )
-when { context.input.action == "tariff_change" }
-when temporal {
-    count_within(24h, Tel::Action::"Execute"::request{
-        input.action: "tariff_change",
-        input.sub: context.input.sub
-    }) > 2
+when {
+    context.input.action == "tariff_change"
+    && context.input.tariff_changes_done >= 2
 };

@@ -23,9 +23,11 @@ OPERATIONS = READ_OPS | WRITE_OPS | OPERATOR_OPS | ALWAYS_OPS | {EXECUTE_OP}
 
 # Ключи идентичности субъекта: их нельзя принимать от модели — объект
 # операции определяется токеном. phone — новое значение контакта, не id.
+# subject — тема тикета в контракте create_ticket, а не идентификатор:
+# в список ключей идентичности он не входит.
 IDENTITY_KEYS = frozenset({
     "sub", "user_id", "msisdn", "subscriber_id", "client_id",
-    "owner_id", "account_id", "user", "subject",
+    "owner_id", "account_id", "user",
 })
 # Единственное легитимное исключение: оператор смотрит чужую карточку по id.
 IDENTITY_ARG_ALLOWED = frozenset({"get_subscriber_overview"})

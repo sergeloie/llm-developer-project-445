@@ -7,8 +7,9 @@
 
 Вызов обёрнут в политику одного повтора: транспортный сбой или 401
 истёкшего токена → перевыпуск токена у издателя, переподключение,
-один повтор. Ошибка роли (forbidden) — не транспортная: она возвращается
-вызывающему как есть.
+один повтор. Ошибки самого инструмента — не транспортные: отказ роли
+(forbidden) и ошибка контракта действия (валидация/бизнес-правило)
+возвращаются вызывающему как есть, без повторного вызова.
 """
 from __future__ import annotations
 
@@ -24,7 +25,9 @@ from mcp.shared.exceptions import MCPError
 
 from core import config
 
-FORBIDDEN_CODE = -32003
+FORBIDDEN_CODE = -32003      # отказ роли/адресата сервера
+ACTION_ERROR_CODE = -32002   # отказ контракта действия: не транспорт
+NON_TRANSPORT_CODES = frozenset({FORBIDDEN_CODE, ACTION_ERROR_CODE})
 
 
 def _client_factory(headers=None, timeout=None, auth=None, **kwargs):
@@ -92,8 +95,8 @@ class McpPool:
         try:
             return await self._call_once(resource_key, tool_name, args)
         except MCPError as e:
-            if getattr(e, "code", None) == FORBIDDEN_CODE:
-                raise  # отказ самого инструмента (например, по роли) — не транспорт
+            if getattr(e, "code", None) in NON_TRANSPORT_CODES:
+                raise  # отказ самого инструмента (роль/контракт) — не транспорт
             return await self._recover_and_retry(resource_key, tool_name, args)
         except Exception:
             return await self._recover_and_retry(resource_key, tool_name, args)

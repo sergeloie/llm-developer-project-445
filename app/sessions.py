@@ -12,6 +12,7 @@ verdikt guardrail хода. Там же функция pep_of(session) — от�
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 
@@ -33,6 +34,8 @@ class Session:
     planner: object | None = None                # собирается лениво на первом ходе
     pending_card: object | None = None           # живая карточка подтверждения
     done_card: object | None = None              # исполненная карточка (для повтора «да»)
+    ticket_id: str = ""                          # тикет, созданный в текущем ходе
+    ticket_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     claims: dict = field(default_factory=dict)   # проверенные claims токена
     allowlist: frozenset = frozenset()           # операции из claims
     pep: object | None = None                    # клиент PDP, лениво
