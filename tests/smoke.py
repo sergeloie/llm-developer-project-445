@@ -352,13 +352,16 @@ async def group_4_permissions() -> None:
     # ── refresh истёкшего токена: клиент восстанавливается сам ──
     # Соединение открываем уже с коротким токеном и ждём его истечения:
     # иначе старый валидный заголовок соединения маскирует 401.
+    # exp издателя считается от целой секунды (int(time.time()) + ttl),
+    # поэтому TTL=1 может истечь ещё до handshake MCP. Берём 3 с: их
+    # хватает на connect, а пауза 4.2 с гарантирует истечение.
     tokens2 = Tokens("boris")
     await tokens2.get("crm")
-    await tokens2.force_short()
+    await tokens2._request("crm", ttl_sec=3)
     pool2 = McpPool(tokens2, resource_keys=("crm",))
     await pool2.connect()
     try:
-        await asyncio.sleep(2.2)
+        await asyncio.sleep(4.2)
         res = await pool2.call("crm", "get_my_profile", {})
         check("4", "token_refresh", res.get("subscriber_id") == "u_9b1c", str(res)[:80])
     finally:

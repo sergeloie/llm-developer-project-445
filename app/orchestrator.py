@@ -338,8 +338,10 @@ async def decide(session, card, answer: str, *, live: bool = True) -> str:
     if verdict == "operator":
         text = await _escalate(session, answer)
         cards.settle(session, card, "escalated")
+        # Текст ответа в журнал не пишется: в аудите есть номер тикета
+        # из _escalate и идентификаторы карточки.
         _audit(session, card.action, "escalated",
-               args={"action": card.action, "pending_id": card.pending_id}, detail=text[:80])
+               args={"action": card.action, "pending_id": card.pending_id})
         return text
     return "Не расслышал ответа: скажите «да», «нет» или «оператор»."
 
